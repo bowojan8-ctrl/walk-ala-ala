@@ -52,7 +52,8 @@ local PlayerGui =
 --==================================================--
 
 -- Semakin kecil semakin detail.
-local RECORD_RATE = 0.04
+-- 1/60 = sekitar 60 sampel per detik.
+local RECORD_RATE = 1 / 60
 
 -- Jarak untuk dianggap sudah mencapai target.
 local WAYPOINT_DISTANCE = 0.75
@@ -61,77 +62,87 @@ local WAYPOINT_DISTANCE = 0.75
 local RESPAWN_WAIT = 3
 
 -- Toleransi waktu playback.
-local TIME_LOOKAHEAD = 0.015
+local TIME_LOOKAHEAD = 0.008
 
--- Berapa frame maksimal yang boleh dilewati
--- dalam satu update playback.
-local MAX_FRAME_SKIP = 1
+-- Jangan lompat terlalu banyak frame dalam satu update.
+local MAX_FRAME_SKIP = 2
 
-local CONFIG_FOLDER =
-    "BaljitotConfigs"
-
-local CONFIG_INDEX_FILE =
-    CONFIG_FOLDER .. "/index.json"
-
--- Legacy file lama, dipakai hanya untuk migrasi sekali.
-local LEGACY_CONFIG_FILE =
-    "BaljitotConfigs.json"
+-- Semua config disimpan sebagai file .tas
+-- di folder filesystem executor.
+local CONFIG_FOLDER = "BaljitotConfigs"
 
 --==================================================--
 -- FILE API
 --==================================================--
 
-local function hasFileAPI()
-    return type(writefile) == "function"
-        and type(readfile) == "function"
-end
-
-local function hasFolderAPI()
-    return type(makefolder) == "function"
-        and type(isfolder) == "function"
-end
-
-local function ensureConfigFolder()
-    if not hasFileAPI() then
-        return false
-    end
-
-    if hasFolderAPI() then
-        local ok, exists = pcall(function()
-            return isfolder(CONFIG_FOLDER)
-        end)
-
-        if ok and not exists then
-            pcall(function()
-                makefolder(CONFIG_FOLDER)
-            end)
-        end
-    else
-        -- Beberapa executor tidak menyediakan isfolder().
-        -- makefolder() tetap dicoba; error ditangkap.
-        if type(makefolder) == "function" then
-            pcall(function()
-                makefolder(CONFIG_FOLDER)
-            end)
-        end
-    end
-
-    return true
-end
-
 local FileAPIAvailable =
-    hasFileAPI()
+    type(writefile) == "function"
+    and type(readfile) == "function"
+
+local FolderAPIAvailable =
+    type(makefolder) == "function"
+
+local ListAPIAvailable =
+    type(listfiles) == "function"
+
+local DeleteAPIAvailable =
+    type(delfile) == "function"
 
 local Configs = {}
 
 local selectedConfig = nil
 
 --==================================================--
--- SERIALIZATION
+-- FILE HELPERS
 --==================================================--
 
+local function ensureConfigFolder()
+
+    if not FileAPIAvailable then
+        return false, "writefile/readfile tidak tersedia"
+    end
+
+    if type(isfolder) == "function" then
+
+        local exists = false
+
+        pcall(function()
+            exists = isfolder(CONFIG_FOLDER)
+        end)
+
+        if exists then
+            return true
+        end
+
+    end
+
+    if FolderAPIAvailable then
+
+        local success, err =
+            pcall(function()
+                makefolder(CONFIG_FOLDER)
+            end)
+
+        if success then
+            return true
+        end
+
+        return false, tostring(err)
+
+    end
+
+    return false, "makefolder/isfolder tidak tersedia"
+end
+
 local function sanitizeConfigName(name)
+
     name = tostring(name or "")
+
+    name = string.gsub(
+        name,
+        "[\\/:*?\"<>|]",
+        "_"
+    )
 
     name = string.gsub(
         name,
@@ -143,12 +154,6 @@ local function sanitizeConfigName(name)
         name,
         "%s+$",
         ""
-    )
-
-    name = string.gsub(
-        name,
-        "[\\/:*?\"<>|]",
-        "_"
     )
 
     name = string.gsub(
@@ -165,14 +170,23 @@ local function sanitizeConfigName(name)
 end
 
 local function getConfigPath(name)
+
     return CONFIG_FOLDER ..
         "/" ..
         sanitizeConfigName(name) ..
         ".tas"
+
 end
 
+--==================================================--
+-- SERIALIZE / DESERIALIZE
+--==================================================--
+
 local function serializeFrame(frame)
-    if not frame or not frame.position then
+
+    if not frame
+        or not frame.position then
+
         return nil
     end
 
@@ -189,54 +203,158 @@ local function serializeFrame(frame)
 
         time = tonumber(frame.time) or 0
     }
+
 end
 
-local function serializeFrames(frameList)
-    local result = {}
+local function serializeConfig(config)
 
-    if type(frameList) ~= "table" then
-        return result
-    end
+    local output = {}
 
-    for _, frame in ipairs(frameList) do
+    for i, frame in ipairs(config or {}) do
+
         local serialized =
             serializeFrame(frame)
 
         if serialized then
-            table.insert(
-                result,
-                serialized
-            )
+            output[i] = serialized
         end
+
     end
 
-    return result
+    return {
+        version = 2,
+        fps = 1 / RECORD_RATE,
+        frames = output
+    }
+
 end
 
-local function writeConfigFile(name, frameList)
-    if not hasFileAPI() then
-        return false
+local function normalizeFrame(frame)
+
+    if not frame then
+        return nil
     end
 
-    if not ensureConfigFolder() then
-        return false
+    local p =
+        frame.position
+        or frame.pos
+
+    if type(p) ~= "table" then
+        return nil
     end
 
-    local cleanName =
-        sanitizeConfigName(name)
+    -- Format baru: x/y/z
+    local x =
+        tonumber(
+            p.x
+            or p.X
+            or 0
+        )
 
-    local payload = {
-        version = 2,
-        name = cleanName,
-        createdAt = os.time(),
-        frames = serializeFrames(frameList)
+    local y =
+        tonumber(
+            p.y
+            or p.Y
+            or 0
+        )
+
+    local z =
+        tonumber(
+            p.z
+            or p.Z
+            or 0
+        )
+
+    return {
+
+        position =
+            Vector3.new(
+                x,
+                y,
+                z
+            ),
+
+        jump =
+            frame.jump == true,
+
+        time =
+            tonumber(
+                frame.time
+            ) or 0
+
     }
+
+end
+
+local function deserializeConfig(data)
+
+    if type(data) ~= "table" then
+        return nil
+    end
+
+    local rawFrames = data.frames
+
+    -- Dukungan config lama yang langsung berupa array.
+    if type(rawFrames) ~= "table" then
+
+        if #data > 0 then
+            rawFrames = data
+        else
+            return nil
+        end
+
+    end
+
+    local output = {}
+
+    for i, rawFrame in ipairs(rawFrames) do
+
+        local frame =
+            normalizeFrame(rawFrame)
+
+        if frame then
+            output[#output + 1] = frame
+        end
+
+    end
+
+    if #output < 1 then
+        return nil
+    end
+
+    return output
+end
+
+--==================================================--
+-- SAVE ONE CONFIG
+--==================================================--
+
+local function saveConfigFile(name, config)
+
+    local folderOK, folderErr =
+        ensureConfigFolder()
+
+    if not folderOK then
+
+        warn(
+            "BALJITOT: folder config gagal:",
+            folderErr
+        )
+
+        return false
+    end
+
+    local path =
+        getConfigPath(name)
+
+    local payload =
+        serializeConfig(config)
 
     local success, err =
         pcall(function()
 
             writefile(
-                getConfigPath(cleanName),
+                path,
                 HttpService:JSONEncode(
                     payload
                 )
@@ -257,12 +375,41 @@ local function writeConfigFile(name, frameList)
     return true
 end
 
-local function readConfigFile(path, fallbackName)
-    if not hasFileAPI() then
+--==================================================--
+-- LOAD ONE CONFIG
+--==================================================--
+
+local function loadConfigFile(name)
+
+    if not FileAPIAvailable then
         return nil
     end
 
-    local success, result =
+    local folderOK =
+        ensureConfigFolder()
+
+    if not folderOK then
+        return nil
+    end
+
+    local path =
+        getConfigPath(name)
+
+    if type(isfile) == "function" then
+
+        local exists = false
+
+        pcall(function()
+            exists = isfile(path)
+        end)
+
+        if not exists then
+            return nil
+        end
+
+    end
+
+    local success, data =
         pcall(function()
 
             return HttpService:JSONDecode(
@@ -271,349 +418,132 @@ local function readConfigFile(path, fallbackName)
 
         end)
 
-    if not success or type(result) ~= "table" then
+    if not success then
+
+        warn(
+            "BALJITOT: gagal membaca [" ..
+            tostring(name) ..
+            "]"
+        )
+
         return nil
     end
 
-    local rawFrames =
-        result.frames
-
-    -- Dukungan file lama yang langsung berupa array.
-    if type(rawFrames) ~= "table"
-        and #result > 0 then
-        rawFrames = result
-    end
-
-    if type(rawFrames) ~= "table" then
-        return nil
-    end
-
-    local decoded = {}
-
-    for _, rawFrame in ipairs(rawFrames) do
-
-        if type(rawFrame) == "table"
-            and type(rawFrame.position) == "table" then
-
-            local p = rawFrame.position
-
-            local x =
-                tonumber(p.x)
-                or tonumber(p.X)
-                or 0
-
-            local y =
-                tonumber(p.y)
-                or tonumber(p.Y)
-                or 0
-
-            local z =
-                tonumber(p.z)
-                or tonumber(p.Z)
-                or 0
-
-            table.insert(
-                decoded,
-                {
-                    position = {
-                        x = x,
-                        y = y,
-                        z = z
-                    },
-
-                    jump =
-                        rawFrame.jump == true,
-
-                    time =
-                        tonumber(
-                            rawFrame.time
-                        ) or 0
-                }
-            )
-
-        end
-
-    end
-
-    if #decoded < 1 then
-        return nil
-    end
-
-    local name =
-        result.name
-
-    if type(name) ~= "string"
-        or name == "" then
-
-        name = fallbackName
-    end
-
-    return sanitizeConfigName(name),
-        decoded
+    return deserializeConfig(data)
 end
 
-local function saveIndex()
-    if not hasFileAPI() then
+--==================================================--
+-- REFRESH CONFIGS FROM FOLDER
+--==================================================--
+
+local function loadConfigsFromFolder()
+
+    Configs = {}
+
+    local folderOK, folderErr =
+        ensureConfigFolder()
+
+    if not folderOK then
+
+        warn(
+            "BALJITOT: config folder tidak tersedia:",
+            folderErr
+        )
+
         return false
     end
 
-    if not ensureConfigFolder() then
+    if not ListAPIAvailable then
+
+        warn(
+            "BALJITOT: listfiles tidak tersedia di executor."
+        )
+
         return false
     end
 
-    local names = {}
-
-    for name in pairs(Configs) do
-        table.insert(names, name)
-    end
-
-    table.sort(
-        names,
-        function(a, b)
-            return string.lower(a)
-                < string.lower(b)
-        end
-    )
-
-    local success =
+    local success, files =
         pcall(function()
 
-            writefile(
-                CONFIG_INDEX_FILE,
-                HttpService:JSONEncode(
-                    {
-                        version = 2,
-                        configs = names
-                    }
-                )
+            return listfiles(
+                CONFIG_FOLDER
             )
 
         end)
 
-    return success
-end
+    if not success
+        or type(files) ~= "table" then
 
-local function saveConfigsToFile()
-    if not hasFileAPI() then
+        warn(
+            "BALJITOT: gagal membaca isi folder config."
+        )
+
         return false
     end
 
-    if not ensureConfigFolder() then
-        return false
-    end
+    for _, fullPath in ipairs(files) do
 
-    local allSaved = true
+        local path =
+            tostring(fullPath)
 
-    for name, data in pairs(Configs) do
+        local fileName =
+            path:match(
+                "([^/\\]+)$"
+            )
 
-        local normalizedName =
-            sanitizeConfigName(name)
+        if fileName
+            and fileName:lower():match(
+                "%.tas$"
+            ) then
 
-        if normalizedName ~= name then
-            Configs[normalizedName] = data
-            Configs[name] = nil
-            name = normalizedName
-        end
-
-        if not writeConfigFile(
-            name,
-            data
-        ) then
-
-            allSaved = false
-
-        end
-
-    end
-
-    if not saveIndex() then
-        allSaved = false
-    end
-
-    return allSaved
-end
-
-local function loadConfigsFromFile()
-
-    if not hasFileAPI() then
-        return false
-    end
-
-    if not ensureConfigFolder() then
-        return false
-    end
-
-    local loaded = {}
-
-    -- Utamakan listfiles agar file .tas yang ada
-    -- di folder bisa langsung ditemukan.
-    if type(listfiles) == "function" then
-
-        local ok, paths =
-            pcall(function()
-                return listfiles(
-                    CONFIG_FOLDER
+            local name =
+                fileName:sub(
+                    1,
+                    -5
                 )
-            end)
 
-        if ok and type(paths) == "table" then
+            local config =
+                loadConfigFile(name)
 
-            for _, path in ipairs(paths) do
-
-                local pathString =
-                    tostring(path)
-
-                if string.lower(
-                    pathString
-                ):match("%.tas$") then
-
-                    local baseName =
-                        pathString:match(
-                            "([^/\\]+)%.tas$"
-                        )
-
-                    if baseName then
-
-                        local loadedName,
-                            data =
-                            readConfigFile(
-                                pathString,
-                                baseName
-                            )
-
-                        if loadedName
-                            and data then
-
-                            loaded[loadedName] =
-                                data
-
-                        end
-
-                    end
-
-                end
-
+            if config then
+                Configs[name] = config
             end
 
         end
 
     end
-
-    -- Fallback memakai index.
-    if next(loaded) == nil
-        and type(isfile) == "function"
-        and isfile(
-            CONFIG_INDEX_FILE
-        ) then
-
-        local ok, indexData =
-            pcall(function()
-
-                return HttpService:JSONDecode(
-                    readfile(
-                        CONFIG_INDEX_FILE
-                    )
-                )
-
-            end)
-
-        if ok
-            and type(indexData) == "table"
-            and type(indexData.configs) == "table" then
-
-            for _, name in ipairs(
-                indexData.configs
-            ) do
-
-                local cleanName =
-                    sanitizeConfigName(name)
-
-                local loadedName,
-                    data =
-                    readConfigFile(
-                        getConfigPath(cleanName),
-                        cleanName
-                    )
-
-                if loadedName
-                    and data then
-
-                    loaded[loadedName] =
-                        data
-
-                end
-
-            end
-
-        end
-
-    end
-
-    -- Migrasi dari format lama bila folder baru kosong.
-    if next(loaded) == nil
-        and type(isfile) == "function"
-        and isfile(
-            LEGACY_CONFIG_FILE
-        ) then
-
-        local ok, legacy =
-            pcall(function()
-
-                return HttpService:JSONDecode(
-                    readfile(
-                        LEGACY_CONFIG_FILE
-                    )
-                )
-
-            end)
-
-        if ok
-            and type(legacy) == "table" then
-
-            for name, data in pairs(legacy) do
-
-                if type(data) == "table" then
-
-                    local serializable =
-                        serializeFrames(
-                            data
-                        )
-
-                    if #serializable > 0 then
-
-                        loaded[
-                            sanitizeConfigName(
-                                name
-                            )
-                        ] = serializable
-
-                    end
-
-                end
-
-            end
-
-            -- Setelah migrasi, simpan ke
-            -- folder per-config.
-            Configs = loaded
-
-            saveConfigsToFile()
-
-            return true
-        end
-
-    end
-
-    Configs = loaded
 
     return true
 end
 
-loadConfigsFromFile()
+-- Load all configs saat start.
+loadConfigsFromFolder()
 
 --==================================================--
--- STATE
---==================================================----==================================================--
+-- SAVE ALL CURRENT CONFIGS
+--==================================================--
+
+local function saveAllConfigsToFiles()
+
+    local ok = true
+
+    for name, config in pairs(Configs) do
+
+        if not saveConfigFile(
+            name,
+            config
+        ) then
+
+            ok = false
+
+        end
+
+    end
+
+    return ok
+end
+
+--==================================================--
 -- STATE
 --==================================================--
 
@@ -624,7 +554,6 @@ local looping = false
 local frames = {}
 
 local recordConnection = nil
-local jumpConnection = nil
 local playConnection = nil
 
 local playToken = 0
@@ -1857,79 +1786,6 @@ CreateButton(
 )
 
 --==================================================--
--- NORMALIZE FRAME
---==================================================--
-
-local function normalizeFrame(frame)
-
-    if not frame then
-        return nil
-    end
-
-    if not frame.position then
-        return nil
-    end
-
-    local p =
-        frame.position
-
-    return {
-
-        position =
-            Vector3.new(
-                tonumber(p.X)
-                    or tonumber(p.x)
-                    or 0,
-
-                tonumber(p.Y)
-                    or tonumber(p.y)
-                    or 0,
-
-                tonumber(p.Z)
-                    or tonumber(p.z)
-                    or 0
-            ),
-
-        jump =
-            frame.jump == true,
-
-        time =
-            tonumber(frame.time)
-            or 0
-
-    }
-
-end
-
-local function normalizeConfig(config)
-    local result = {}
-
-    if type(config) ~= "table" then
-        return result
-    end
-
-    for _, rawFrame in ipairs(config) do
-
-        local frame =
-            normalizeFrame(
-                rawFrame
-            )
-
-        if frame then
-            table.insert(
-                result,
-                frame
-            )
-        end
-
-    end
-
-    return result
-end
-
---==================================================--
--- MERGE CONFIGS
---==================================================----==================================================--
 -- MERGE CONFIGS
 --==================================================--
 
@@ -2066,13 +1922,20 @@ CreateButton(
         end
 
         Configs[name] =
-            serializeFrames(merged)
+            merged
 
         selectedConfig =
             name
 
-        local saved =
-            saveConfigsToFile()
+        if not saveConfigFile(
+            name,
+            merged
+        ) then
+
+            Status.Text =
+                "STATUS: MERGE SAVE FAILED"
+
+        end
 
         refreshConfigList()
 
@@ -2107,36 +1970,41 @@ CreateButton(
         end
 
         local name =
-            ConfigNameBox.Text
-
-        name =
-            string.gsub(
-                name,
-                "^%s+",
-                ""
+            sanitizeConfigName(
+                ConfigNameBox.Text
             )
 
-        name =
-            string.gsub(
-                name,
-                "%s+$",
-                ""
-            )
+        local copied = {}
 
-        if name == "" then
+        for i, frame in
+            ipairs(frames) do
 
-            name =
-                "CP_" ..
-                tostring(
-                    os.time()
-                )
+            local serialized =
+                serializeFrame(frame)
+
+            if serialized then
+
+                local normalized =
+                    normalizeFrame(
+                        serialized
+                    )
+
+                if normalized then
+                    copied[#copied + 1] =
+                        normalized
+                end
+
+            end
 
         end
 
-        local copied =
-            serializeFrames(
-                frames
-            )
+        if #copied < 2 then
+
+            Status.Text =
+                "STATUS: INVALID RECORD"
+
+            return
+        end
 
         Configs[name] =
             copied
@@ -2145,7 +2013,10 @@ CreateButton(
             name
 
         local saved =
-            saveConfigsToFile()
+            saveConfigFile(
+                name,
+                copied
+            )
 
         refreshConfigList()
 
@@ -2161,7 +2032,7 @@ CreateButton(
         else
 
             Status.Text =
-                "STATUS: SAVED SESSION [" ..
+                "STATUS: SAVE FAILED [" ..
                 name ..
                 "]"
 
@@ -2196,46 +2067,44 @@ CreateButton(
         end
 
         local config =
-            Configs[selectedConfig]
+            loadConfigFile(
+                selectedConfig
+            )
 
         if not config then
 
             Status.Text =
                 "STATUS: CONFIG NOT FOUND"
 
-            selectedConfig = nil
+            Configs[selectedConfig] = nil
 
             refreshConfigList()
 
             return
         end
 
+        Configs[selectedConfig] =
+            config
+
         frames = {}
 
-        for i, rawFrame in
+        for i, frame in
             ipairs(config) do
 
-            local frame =
-                normalizeFrame(
-                    rawFrame
-                )
+            frames[i] = {
+                position =
+                    Vector3.new(
+                        frame.position.X,
+                        frame.position.Y,
+                        frame.position.Z
+                    ),
 
-            if frame then
+                jump =
+                    frame.jump == true,
 
-                frames[i] = {
-
-                    position =
-                        frame.position,
-
-                    jump =
-                        frame.jump,
-
-                    time =
-                        frame.time
-
-                }
-
-            end
+                time =
+                    frame.time or 0
+            }
 
         end
 
@@ -2267,35 +2136,65 @@ CreateButton(
             return
         end
 
+        if playing
+            or recording then
+
+            Status.Text =
+                "STATUS: STOP ACTIVE ACTION FIRST"
+
+            return
+        end
+
         local name =
             selectedConfig
 
-        Configs[name] = nil
+        local path =
+            getConfigPath(name)
 
-        selectedConfig = nil
+        local deleted = false
 
-        if type(delfile) == "function"
-            and isfile
-            and isfile(
-                getConfigPath(name)
-            ) then
+        if DeleteAPIAvailable then
 
-            pcall(function()
-                delfile(
-                    getConfigPath(name)
-                )
-            end)
+            local success =
+                pcall(function()
+
+                    if type(isfile) ~= "function"
+                        or isfile(path) then
+
+                        delfile(path)
+                        deleted = true
+
+                    end
+
+                end)
+
+            if not success then
+                deleted = false
+            end
 
         end
 
-        saveConfigsToFile()
+        Configs[name] = nil
+        selectedConfig = nil
 
         refreshConfigList()
 
-        Status.Text =
-            "STATUS: DELETED [" ..
-            name ..
-            "]"
+        if deleted
+            or not FileAPIAvailable then
+
+            Status.Text =
+                "STATUS: DELETED [" ..
+                name ..
+                "]"
+
+        else
+
+            Status.Text =
+                "STATUS: DELETE FAILED [" ..
+                name ..
+                "]"
+
+        end
 
     end
 )
@@ -2308,7 +2207,7 @@ CreateButton(
     "REFRESH CONFIG LIST",
     function()
 
-        loadConfigsFromFile()
+        loadConfigsFromFolder()
 
         refreshConfigList()
 
@@ -2351,11 +2250,6 @@ RecordBtn =
 
                 end
 
-                if jumpConnection then
-                    jumpConnection:Disconnect()
-                    jumpConnection = nil
-                end
-
                 button.Text =
                     "RECORD PATH: OFF"
 
@@ -2395,33 +2289,27 @@ RecordBtn =
                 humanoid =
                 getCharacter()
 
-            if jumpConnection then
-                jumpConnection:Disconnect()
-                jumpConnection = nil
-            end
-
             if humanoid then
 
-                jumpConnection =
-                    humanoid.StateChanged:Connect(
-                        function(
-                            oldState,
-                            newState
-                        )
+                humanoid.StateChanged:Connect(
+                    function(
+                        oldState,
+                        newState
+                    )
 
-                            if not recording then
-                                return
-                            end
+                        if not recording then
+                            return
+                        end
 
-                            if newState ==
-                                Enum.HumanoidStateType.Jumping then
+                        if newState ==
+                            Enum.HumanoidStateType.Jumping then
 
-                                jumpQueued = true
-
-                            end
+                            jumpQueued = true
 
                         end
-                    )
+
+                    end
+                )
 
             end
 
@@ -2584,11 +2472,6 @@ CreateButton(
 
             recordConnection = nil
 
-        end
-
-        if jumpConnection then
-            jumpConnection:Disconnect()
-            jumpConnection = nil
         end
 
         RecordBtn.Text =
@@ -3073,20 +2956,12 @@ LoopBtn =
                 task.spawn(
                     function()
 
-                        local loopConfigName =
-                            selectedConfig
-
                         while looping do
 
-                            local storedConfig =
-                                Configs[
-                                    loopConfigName
-                                ]
-
-                            if type(storedConfig) ~= "table" then
+                            if #frames < 2 then
 
                                 Status.Text =
-                                    "STATUS: LOOP CONFIG NOT FOUND"
+                                    "STATUS: NO PATH"
 
                                 looping =
                                     false
@@ -3096,29 +2971,6 @@ LoopBtn =
 
                                 break
                             end
-
-                            local loopFrames =
-                                normalizeConfig(
-                                    storedConfig
-                                )
-
-                            if #loopFrames < 2 then
-
-                                Status.Text =
-                                    "STATUS: LOOP CONFIG INVALID"
-
-                                looping =
-                                    false
-
-                                button.Text =
-                                    "LOOP: OFF"
-
-                                break
-                            end
-
-                            -- Gunakan salinan runtime dari config yang
-                            -- dipilih. Reset basecamp tidak menghapus data ini.
-                            frames = loopFrames
 
                             playPath()
 
@@ -3134,7 +2986,7 @@ LoopBtn =
                             end
 
                             Status.Text =
-                                "STATUS: RESETTING TO BASECAMP..."
+                                "STATUS: RESETTING..."
 
                             local success =
                                 resetToBasecamp()
@@ -3249,7 +3101,7 @@ Info.Text =
     "RECORD: jalan + diam + jump.\n" ..
     "RECORD RATE: 0.04 detik.\n" ..
     "PLAYBACK: mengikuti timestamp rekaman.\n" ..
-    "SAVE: simpan CP sebagai file .tas.\n" ..
+    "SAVE: simpan CP sebagai config.\n" ..
     "ADD SELECTED: masukkan CP ke Merge Queue.\n" ..
     "Klik item queue untuk menghapusnya.\n" ..
     "MERGE: gabungkan sesuai urutan queue."
@@ -3291,8 +3143,7 @@ FileStatus.Font =
 if FileAPIAvailable then
 
     FileStatus.Text =
-        "FILE SAVE: " ..
-        CONFIG_FOLDER
+        "FILE SAVE: FOLDER MODE"
 
 else
 
@@ -3386,11 +3237,6 @@ CloseBtn.MouseButton1Click:Connect(
 
         end
 
-        if jumpConnection then
-            jumpConnection:Disconnect()
-            jumpConnection = nil
-        end
-
         if playConnection then
 
             playConnection:Disconnect()
@@ -3401,7 +3247,7 @@ CloseBtn.MouseButton1Click:Connect(
 
         stopMovement()
 
-        saveConfigsToFile()
+        saveAllConfigsToFiles()
 
         local tween =
             TweenService:Create(
@@ -3489,9 +3335,7 @@ print(
 
 print(
     "FILE API:",
-    FileAPIAvailable,
-    "FOLDER:",
-    CONFIG_FOLDER
+    FileAPIAvailable
 )
 
 print(
